@@ -1,18 +1,23 @@
 #include "datastruct.h"
 
+#include "sqlite3.h"
+
 #include <filesystem>
 #include <fstream>
 #include <sstream>
 #include <utility>
+#include <vector>
 
 namespace {
-// ATM 数据文件采用 | 分隔的 UTF-8 文本格式，便于课程作业直接查看。
+// 旧版本 .dat 文件使用 | 分隔，迁移时仍保留这个解析器。
 std::vector<std::string> split(const std::string& line) {
+    std::string normalizedLine = line;
+    if (!normalizedLine.empty() && normalizedLine.back() == '\r') normalizedLine.pop_back();
     std::vector<std::string> fields;
-    std::stringstream stream(line);
+    std::stringstream stream(normalizedLine);
     std::string field;
     while (std::getline(stream, field, '|')) fields.push_back(field);
-    if (!line.empty() && line.back() == '|') fields.emplace_back();
+    if (!normalizedLine.empty() && normalizedLine.back() == '|') fields.emplace_back();
     return fields;
 }
 
@@ -24,6 +29,32 @@ bool parseLongLong(const std::string& value, long long& result) {
     } catch (...) {
         return false;
     }
+}
+
+std::string textColumn(sqlite3_stmt* statement, int index) {
+    const unsigned char* value = sqlite3_column_text(statement, index);
+    return value == nullptr ? std::string() : reinterpret_cast<const char*>(value);
+}
+
+void archiveLegacyFile(const std::filesystem::path& filePath) {
+    if (!std::filesystem::exists(filePath)) return;
+    std::filesystem::path backupPath = filePath;
+    backupPath += ".legacy";
+    std::error_code filesystemError;
+    if (std::filesystem::exists(backupPath)) {
+        std::filesystem::remove(filePath, filesystemError);
+    } else {
+        std::filesystem::rename(filePath, backupPath, filesystemError);
+    }
+}
+
+bool execute(sqlite3* database, const char* sql, std::string& error) {
+    char* sqliteError = nullptr;
+    const int result = sqlite3_exec(database, sql, nullptr, nullptr, &sqliteError);
+    if (result == SQLITE_OK) return true;
+    error = sqliteError == nullptr ? sqlite3_errmsg(database) : sqliteError;
+    if (sqliteError != nullptr) sqlite3_free(sqliteError);
+    return false;
 }
 
 std::vector<Account> sampleAccounts() {
@@ -55,21 +86,127 @@ std::vector<Account> sampleAccounts() {
 
 DataStore::DataStore(std::string directory) : baseDirectory(std::move(directory)) {}
 
-bool DataStore::createDefaultData(std::string& error) {
-    accounts.clear();
-    statements.clear();
-    for (const auto& account : sampleAccounts()) accounts.emplace(account.id, account);
-    return save(error);
+DataStore::~DataStore() {
+    if (database != nullptr) sqlite3_close(database);
+}
+
+void DataStore::setBaseDirectory(std::string directory) {
+    if (database != nullptr) {
+        sqlite3_close(database);
+        database = nullptr;
+    }
+    baseDirectory = std::move(directory);
+}
+
+bool DataStore::openDatabase(std::string& error) {
+    if (database != nullptr) return true;
+    const std::filesystem::path databasePath = std::filesystem::path(baseDirectory) / "atm.db";
+    const int result = sqlite3_open_v2(databasePath.u8string().c_str(), &database,
+                                       SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE, nullptr);
+    if (result != SQLITE_OK) {
+        error = database == nullptr ? "无法打开 SQLite 数据库。" : sqlite3_errmsg(database);
+        if (database != nullptr) sqlite3_close(database);
+        database = nullptr;
+        return false;
+    }
+    return execute(database, "PRAGMA foreign_keys = ON;", error);
+}
+
+bool DataStore::ensureSchema(std::string& error) const {
+    static constexpr char schema[] =
+        "CREATE TABLE IF NOT EXISTS accounts ("
+        "id TEXT PRIMARY KEY NOT NULL,"
+        "name TEXT NOT NULL,"
+        "pin TEXT NOT NULL,"
+        "phone TEXT NOT NULL,"
+        "balance_cents INTEGER NOT NULL DEFAULT 0,"
+        "status INTEGER NOT NULL DEFAULT 0"
+        ");"
+        "CREATE TABLE IF NOT EXISTS statements ("
+        "id INTEGER PRIMARY KEY NOT NULL,"
+        "account_id TEXT NOT NULL,"
+        "time TEXT NOT NULL,"
+        "type INTEGER NOT NULL,"
+        "amount_cents INTEGER NOT NULL DEFAULT 0,"
+        "to_account TEXT NOT NULL DEFAULT '',"
+        "FOREIGN KEY(account_id) REFERENCES accounts(id) ON DELETE CASCADE"
+        ");";
+    return execute(database, schema, error);
 }
 
 bool DataStore::loadAccounts(std::string& error) {
-    std::ifstream input(std::filesystem::path(baseDirectory) / "accounts.dat", std::ios::binary);
-    if (!input) return createDefaultData(error);
+    accounts.clear();
+    sqlite3_stmt* statement = nullptr;
+    const char* sql = "SELECT id, name, pin, phone, balance_cents, status FROM accounts ORDER BY id;";
+    if (sqlite3_prepare_v2(database, sql, -1, &statement, nullptr) != SQLITE_OK) {
+        error = sqlite3_errmsg(database);
+        return false;
+    }
+
+    int result = SQLITE_ROW;
+    while ((result = sqlite3_step(statement)) == SQLITE_ROW) {
+        const long long balance = sqlite3_column_int64(statement, 4);
+        const int status = sqlite3_column_int(statement, 5);
+        if (status != 0 && status != 1) {
+            error = "数据库中的账户状态无效。";
+            sqlite3_finalize(statement);
+            return false;
+        }
+        const std::string id = textColumn(statement, 0);
+        accounts[id] = Account{
+            id, textColumn(statement, 1), textColumn(statement, 2), textColumn(statement, 3),
+            balance, status == 0 ? CardStatus::Normal : CardStatus::Retained
+        };
+    }
+    if (result != SQLITE_DONE) {
+        error = sqlite3_errmsg(database);
+        sqlite3_finalize(statement);
+        return false;
+    }
+    sqlite3_finalize(statement);
+    return true;
+}
+
+bool DataStore::loadStatements(std::string& error) {
+    statements.clear();
+    sqlite3_stmt* statement = nullptr;
+    const char* sql = "SELECT id, account_id, time, type, amount_cents, to_account "
+                      "FROM statements ORDER BY id;";
+    if (sqlite3_prepare_v2(database, sql, -1, &statement, nullptr) != SQLITE_OK) {
+        error = sqlite3_errmsg(database);
+        return false;
+    }
+
+    int result = SQLITE_ROW;
+    while ((result = sqlite3_step(statement)) == SQLITE_ROW) {
+        const int type = sqlite3_column_int(statement, 3);
+        if (type < 1 || type > 5) {
+            error = "数据库中的流水类型无效。";
+            sqlite3_finalize(statement);
+            return false;
+        }
+        statements.push_back(Statement{
+            sqlite3_column_int64(statement, 0), textColumn(statement, 1), textColumn(statement, 2),
+            static_cast<StatementType>(type), sqlite3_column_int64(statement, 4), textColumn(statement, 5)
+        });
+    }
+    if (result != SQLITE_DONE) {
+        error = sqlite3_errmsg(database);
+        sqlite3_finalize(statement);
+        return false;
+    }
+    sqlite3_finalize(statement);
+    return true;
+}
+
+bool DataStore::loadLegacyAccounts(std::string& error) {
+    const std::filesystem::path filePath = std::filesystem::path(baseDirectory) / "accounts.dat";
+    std::ifstream input(filePath, std::ios::binary);
+    if (!input) return true;
 
     accounts.clear();
-    std::string line;
-    // 兼容旧版五字段账户文件，并在加载时补充手机号和缺失的样本账户。
     bool sawLegacyFormat = false;
+    std::string line;
     while (std::getline(input, line)) {
         if (line.empty()) continue;
         const auto fields = split(line);
@@ -78,43 +215,36 @@ bool DataStore::loadAccounts(std::string& error) {
             return false;
         }
 
-        long long balance = 0;
-        long long status = 0;
         const bool legacyFormat = fields.size() == 5;
         sawLegacyFormat = sawLegacyFormat || legacyFormat;
-        const std::string phone = legacyFormat ? "13800000000" : fields[3];
         const std::size_t balanceIndex = legacyFormat ? 3 : 4;
         const std::size_t statusIndex = legacyFormat ? 4 : 5;
+        long long balance = 0;
+        long long status = 0;
         if (!parseLongLong(fields[balanceIndex], balance) || !parseLongLong(fields[statusIndex], status) ||
             (status != 0 && status != 1) || fields[0].empty() || fields[2].empty()) {
             error = "accounts.dat 文件中存在无效账户数据。";
             return false;
         }
+        const std::string phone = legacyFormat ? "13800000000" : fields[3];
         accounts[fields[0]] = Account{
             fields[0], fields[1], fields[2], phone, balance,
             status == 0 ? CardStatus::Normal : CardStatus::Retained
         };
     }
 
-    if (accounts.empty()) {
-        error = "accounts.dat 中没有账户数据。";
-        return false;
-    }
     if (sawLegacyFormat && accounts.size() < 20) {
         for (const auto& sample : sampleAccounts()) {
             if (accounts.find(sample.id) == accounts.end()) accounts.emplace(sample.id, sample);
         }
-        return save(error);
     }
     return true;
 }
 
-bool DataStore::loadStatements(std::string& error) {
-    std::ifstream input(std::filesystem::path(baseDirectory) / "statements.dat", std::ios::binary);
-    if (!input) {
-        statements.clear();
-        return true;
-    }
+bool DataStore::loadLegacyStatements(std::string& error) {
+    const std::filesystem::path filePath = std::filesystem::path(baseDirectory) / "statements.dat";
+    std::ifstream input(filePath, std::ios::binary);
+    if (!input) return true;
 
     statements.clear();
     std::string line;
@@ -145,56 +275,111 @@ bool DataStore::load(std::string& error) {
     std::error_code filesystemError;
     std::filesystem::create_directories(baseDirectory, filesystemError);
     if (filesystemError) {
-        error = "无法创建数据目录。";
+        error = "无法创建数据库目录。";
         return false;
     }
+    if (!openDatabase(error) || !ensureSchema(error)) return false;
     if (!loadAccounts(error)) return false;
+
+    if (accounts.empty()) {
+        const bool hasLegacyAccounts = std::filesystem::exists(
+            std::filesystem::path(baseDirectory) / "accounts.dat");
+        if (hasLegacyAccounts) {
+            if (!loadLegacyAccounts(error) || !loadLegacyStatements(error)) return false;
+            if (accounts.empty()) return createDefaultData(error);
+            if (!save(error)) return false;
+            // 迁移成功后归档旧文件，避免下次启动重复导入。
+            archiveLegacyFile(std::filesystem::path(baseDirectory) / "accounts.dat");
+            archiveLegacyFile(std::filesystem::path(baseDirectory) / "statements.dat");
+            return true;
+        }
+        return createDefaultData(error);
+    }
     return loadStatements(error);
 }
 
 bool DataStore::save(std::string& error) const {
-    std::error_code filesystemError;
-    std::filesystem::create_directories(baseDirectory, filesystemError);
-    if (filesystemError) {
-        error = "无法创建数据目录。";
+    if (database == nullptr) {
+        error = "SQLite 数据库尚未打开。";
+        return false;
+    }
+    if (!execute(database, "BEGIN IMMEDIATE TRANSACTION;", error)) return false;
+
+    auto rollback = [&]() {
+        std::string ignored;
+        execute(database, "ROLLBACK;", ignored);
+    };
+
+    if (!execute(database, "DELETE FROM statements; DELETE FROM accounts;", error)) {
+        rollback();
         return false;
     }
 
-    // 账户和流水分别保存，开发者可以直接用文本工具检查数据。
-    std::ofstream accountOutput(std::filesystem::path(baseDirectory) / "accounts.dat",
-                                std::ios::binary | std::ios::trunc);
-    if (!accountOutput) {
-        error = "无法写入 accounts.dat。";
+    sqlite3_stmt* accountStatement = nullptr;
+    const char* accountSql = "INSERT INTO accounts "
+                             "(id, name, pin, phone, balance_cents, status) VALUES (?, ?, ?, ?, ?, ?);";
+    if (sqlite3_prepare_v2(database, accountSql, -1, &accountStatement, nullptr) != SQLITE_OK) {
+        error = sqlite3_errmsg(database);
+        rollback();
         return false;
     }
     for (const auto& [id, account] : accounts) {
-        accountOutput << account.id << '|' << account.name << '|' << account.pin << '|'
-                      << account.phone << '|' << account.balanceCents << '|'
-                      << (account.status == CardStatus::Normal ? 0 : 1) << '\n';
+        sqlite3_bind_text(accountStatement, 1, account.id.c_str(), -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(accountStatement, 2, account.name.c_str(), -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(accountStatement, 3, account.pin.c_str(), -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(accountStatement, 4, account.phone.c_str(), -1, SQLITE_TRANSIENT);
+        sqlite3_bind_int64(accountStatement, 5, account.balanceCents);
+        sqlite3_bind_int(accountStatement, 6, account.status == CardStatus::Normal ? 0 : 1);
+        if (sqlite3_step(accountStatement) != SQLITE_DONE) {
+            error = sqlite3_errmsg(database);
+            sqlite3_finalize(accountStatement);
+            rollback();
+            return false;
+        }
+        sqlite3_reset(accountStatement);
+        sqlite3_clear_bindings(accountStatement);
     }
-    accountOutput.flush();
-    if (!accountOutput) {
-        error = "保存 accounts.dat 时发生写入错误。";
-        return false;
-    }
+    sqlite3_finalize(accountStatement);
 
-    std::ofstream statementOutput(std::filesystem::path(baseDirectory) / "statements.dat",
-                                  std::ios::binary | std::ios::trunc);
-    if (!statementOutput) {
-        error = "无法写入 statements.dat。";
+    sqlite3_stmt* statementStatement = nullptr;
+    const char* statementSql = "INSERT INTO statements "
+                               "(id, account_id, time, type, amount_cents, to_account) "
+                               "VALUES (?, ?, ?, ?, ?, ?);";
+    if (sqlite3_prepare_v2(database, statementSql, -1, &statementStatement, nullptr) != SQLITE_OK) {
+        error = sqlite3_errmsg(database);
+        rollback();
         return false;
     }
     for (const auto& statement : statements) {
-        statementOutput << statement.id << '|' << statement.accountId << '|' << statement.time << '|'
-                        << static_cast<int>(statement.type) << '|' << statement.amountCents << '|'
-                        << statement.toAccount << '\n';
+        sqlite3_bind_int64(statementStatement, 1, statement.id);
+        sqlite3_bind_text(statementStatement, 2, statement.accountId.c_str(), -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(statementStatement, 3, statement.time.c_str(), -1, SQLITE_TRANSIENT);
+        sqlite3_bind_int(statementStatement, 4, static_cast<int>(statement.type));
+        sqlite3_bind_int64(statementStatement, 5, statement.amountCents);
+        sqlite3_bind_text(statementStatement, 6, statement.toAccount.c_str(), -1, SQLITE_TRANSIENT);
+        if (sqlite3_step(statementStatement) != SQLITE_DONE) {
+            error = sqlite3_errmsg(database);
+            sqlite3_finalize(statementStatement);
+            rollback();
+            return false;
+        }
+        sqlite3_reset(statementStatement);
+        sqlite3_clear_bindings(statementStatement);
     }
-    statementOutput.flush();
-    if (!statementOutput) {
-        error = "保存 statements.dat 时发生写入错误。";
+    sqlite3_finalize(statementStatement);
+
+    if (!execute(database, "COMMIT;", error)) {
+        rollback();
         return false;
     }
     return true;
+}
+
+bool DataStore::createDefaultData(std::string& error) {
+    accounts.clear();
+    statements.clear();
+    for (const auto& account : sampleAccounts()) accounts.emplace(account.id, account);
+    return save(error);
 }
 
 Account* DataStore::findAccount(const std::string& id) {

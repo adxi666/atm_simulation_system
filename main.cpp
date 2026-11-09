@@ -285,7 +285,7 @@ bool configureDataStore() {
         }
     }
 
-    g_store = DataStore(fixedDirectory.u8string());
+    g_store.setBaseDirectory(fixedDirectory.u8string());
     return true;
 }
 //初始登录菜单
