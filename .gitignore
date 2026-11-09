@@ -1,0 +1,19 @@
+# IDE settings
+.idea/
+
+# CMake build directories and generated binaries
+cmake-build-*/
+build/
+*.exe
+*.obj
+*.o
+
+# Runtime ATM data: keep account and transaction files local
+data/
+atm_data/
+accounts.dat
+statements.dat
+
+# Temporary files
+*.tmp
+*.log
