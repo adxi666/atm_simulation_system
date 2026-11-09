@@ -6,6 +6,7 @@
 #include <utility>
 
 namespace {
+// ATM 数据文件采用 | 分隔的 UTF-8 文本格式，便于课程作业直接查看。
 std::vector<std::string> split(const std::string& line) {
     std::vector<std::string> fields;
     std::stringstream stream(line);
@@ -26,6 +27,7 @@ bool parseLongLong(const std::string& value, long long& result) {
 }
 
 std::vector<Account> sampleAccounts() {
+    // 首次运行时提供 20 个案例账户，方便直接演示登录和转账。
     return {
         {"100001", "张三", "123456", "13800000001", 50000, CardStatus::Normal},
         {"100002", "李四", "654321", "13800000002", 30000, CardStatus::Normal},
@@ -66,6 +68,7 @@ bool DataStore::loadAccounts(std::string& error) {
 
     accounts.clear();
     std::string line;
+    // 兼容旧版五字段账户文件，并在加载时补充手机号和缺失的样本账户。
     bool sawLegacyFormat = false;
     while (std::getline(input, line)) {
         if (line.empty()) continue;
@@ -157,6 +160,7 @@ bool DataStore::save(std::string& error) const {
         return false;
     }
 
+    // 账户和流水分别保存，开发者可以直接用文本工具检查数据。
     std::ofstream accountOutput(std::filesystem::path(baseDirectory) / "accounts.dat",
                                 std::ios::binary | std::ios::trunc);
     if (!accountOutput) {

@@ -82,6 +82,7 @@ int g_loginFailures = 0;
 Page g_page = Page::Login;
 std::vector<HWND> g_pageControls;
 
+// Win32 窗口和本地数据文件之间使用 UTF-8/UTF-16 转换。
 std::wstring utf8ToWide(const std::string& value) {
     if (value.empty()) return {};
     const int size = MultiByteToWideChar(CP_UTF8, 0, value.data(), static_cast<int>(value.size()), nullptr, 0);
@@ -146,6 +147,7 @@ std::wstring formatMoney(long long cents) {
     return stream.str();
 }
 
+// 只接受正数金额，并统一转换成“分”保存。
 bool parseAmount(const std::wstring& input, long long& cents) {
     if (input.empty()) return false;
     const std::size_t dot = input.find(L'.');
@@ -196,7 +198,7 @@ std::string nowString() {
     std::strftime(buffer, sizeof(buffer), "%Y-%m-%d %H:%M:%S", &local);
     return buffer;
 }
-
+//二级菜单
 std::wstring statementTypeName(StatementType type) {
     switch (type) {
         case StatementType::Deposit: return L"存款";
@@ -234,6 +236,7 @@ void clearPage() {
     g_pageControls.clear();
 }
 
+// 每个业务页面复用同一个主窗口，只替换内容区控件。
 void addPageHeader(const std::wstring& title, const std::wstring& subtitle = L"") {
     addLabel(title, 60, 35, 820, 44);
     if (!subtitle.empty()) addLabel(subtitle, 60, 82, 820, 32);
@@ -251,6 +254,7 @@ void showStatements();
 void showChangePin();
 void showDeleteAccount();
 
+// 创建固定的数据目录，并把旧版本工作目录中的文件迁移过来。
 bool configureDataStore() {
     std::wstring modulePath(32768, L'\0');
     const DWORD length = GetModuleFileNameW(nullptr, modulePath.data(), static_cast<DWORD>(modulePath.size()));
@@ -284,7 +288,7 @@ bool configureDataStore() {
     g_store = DataStore(fixedDirectory.u8string());
     return true;
 }
-
+//初始登录菜单
 void showLogin() {
     clearPage();
     g_page = Page::Login;
@@ -299,7 +303,7 @@ void showLogin() {
     addButton(L"退出程序", IDM_EXIT, 565, 390, 140, 44);
     addLabel(L"演示账户：100001 / 123456；其余样本账户默认密码均为 123456", 180, 480, 650, 32);
 }
-
+//开户菜单
 void showOpenAccount() {
     clearPage();
     g_page = Page::OpenAccount;
@@ -317,7 +321,7 @@ void showOpenAccount() {
     addButton(L"确认开户", IDC_OPEN_BUTTON, 390, 440, 140, 44);
     addButton(L"返回登录", IDC_BACK_BUTTON, 550, 440, 140, 44);
 }
-
+//修改密码菜单
 void showResetPassword() {
     clearPage();
     g_page = Page::ResetPassword;
@@ -352,7 +356,7 @@ void showMenu() {
     addButton(L"注销账户", IDM_DELETE_ACCOUNT, 160, 370, 190, 48);
     addButton(L"退出登录", IDM_LOGOUT, 390, 370, 190, 48);
 }
-
+//账户查询菜单
 void showBalance() {
     clearPage();
     g_page = Page::Balance;
@@ -365,7 +369,7 @@ void showBalance() {
     }
     addButton(L"返回主菜单", IDC_BACK_BUTTON, 390, 390, 180, 44);
 }
-
+//存款菜单
 void showDeposit() {
     clearPage();
     g_page = Page::Deposit;
@@ -375,7 +379,7 @@ void showDeposit() {
     addButton(L"确认存款", IDC_DEPOSIT_BUTTON, 390, 270, 140, 44);
     addButton(L"返回", IDC_BACK_BUTTON, 550, 270, 140, 44);
 }
-
+//取款菜单
 void showWithdraw() {
     clearPage();
     g_page = Page::Withdraw;
@@ -385,7 +389,7 @@ void showWithdraw() {
     addButton(L"确认取款", IDC_WITHDRAW_BUTTON, 390, 270, 140, 44);
     addButton(L"返回", IDC_BACK_BUTTON, 550, 270, 140, 44);
 }
-
+//转账菜单
 void showTransfer() {
     clearPage();
     g_page = Page::Transfer;
@@ -397,7 +401,7 @@ void showTransfer() {
     addButton(L"确认转账", IDC_TRANSFER_BUTTON, 390, 315, 140, 44);
     addButton(L"返回", IDC_BACK_BUTTON, 550, 315, 140, 44);
 }
-
+//流水菜单
 void showStatements() {
     clearPage();
     g_page = Page::Statements;
@@ -417,7 +421,7 @@ void showStatements() {
     }
     addButton(L"返回主菜单", IDC_BACK_BUTTON, 390, 530, 180, 44);
 }
-
+//修改密码菜单
 void showChangePin() {
     clearPage();
     g_page = Page::ChangePin;
@@ -431,7 +435,7 @@ void showChangePin() {
     addButton(L"确认修改", IDC_CHANGE_PIN_BUTTON, 390, 365, 140, 44);
     addButton(L"返回", IDC_BACK_BUTTON, 550, 365, 140, 44);
 }
-
+//销户菜单
 void showDeleteAccount() {
     clearPage();
     g_page = Page::DeleteAccount;
@@ -473,6 +477,7 @@ void handleLogin() {
     showMenu();
 }
 
+// 开户时由用户选择唯一的六位账户 ID，余额固定从零开始。
 void handleOpenAccount() {
     const std::wstring idInput = readText(GetDlgItem(g_window, IDC_OPEN_ID));
     const std::wstring name = readText(GetDlgItem(g_window, IDC_OPEN_NAME));
@@ -528,6 +533,7 @@ void handleOpenAccount() {
     showLogin();
 }
 
+// 通过账户 ID、手机号尾号和新密码完成密码重设。
 void handleResetPassword() {
     const std::string id = wideToUtf8(readText(GetDlgItem(g_window, IDC_RESET_ID)));
     const std::wstring phoneTail = readText(GetDlgItem(g_window, IDC_RESET_PHONE));
