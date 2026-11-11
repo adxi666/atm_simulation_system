@@ -5,9 +5,7 @@
 #include <string>
 #include <vector>
 
-struct sqlite3;
-
-// 密码存储采用 bcrypt（加盐 + 慢哈希，具体思路见 password_hasher.h 顶部注释）。
+// 密码存储采用 bcrypt（加盐 + 慢哈希），持久化文件只保存 pinHash。
 
 // 卡片状态：正常卡可以登录，吞卡后禁止继续使用。
 enum class CardStatus {
@@ -15,7 +13,7 @@ enum class CardStatus {
     Retained = 1
 };
 
-// 流水类型，数值会保存到 SQLite 的 type 字段。
+// 流水类型，数值会直接写入 statements.dat。
 enum class StatementType {
     Deposit = 1,
     Withdraw = 2,
@@ -28,9 +26,7 @@ enum class StatementType {
 struct Account {
     std::string id;
     std::string name;
-    // 密码列（数据库 accounts.pin）。这里保存的是 bcrypt 哈希，例如
-    // "$2b$10$N9qo8uLOickgx2ZMRZoMyeIjZAgcfl7p92ldGxad68LJZdL17lhWy"，
-    // 绝不是明文密码；校验统一使用 bcrypt::verifyPassword()。
+    // 这里保存的是 bcrypt 哈希，不是用户输入的明文密码。
     std::string pinHash;
     std::string phone;
     long long balanceCents = 0;
@@ -47,16 +43,11 @@ struct Statement {
     std::string toAccount;
 };
 
-// SQLite 本地数据库仓库，同时保留内存缓存供界面业务逻辑使用。
+// 本地文本数据仓库：负责账户和交易流水的加载、保存及查询。
 class DataStore {
 public:
     explicit DataStore(std::string baseDirectory = ".");
-    ~DataStore();
 
-    DataStore(const DataStore&) = delete;
-    DataStore& operator=(const DataStore&) = delete;
-
-    void setBaseDirectory(std::string directory);
     bool load(std::string& error);
     bool save(std::string& error) const;
 
@@ -71,20 +62,10 @@ public:
 
 private:
     std::string baseDirectory;
-    sqlite3* database = nullptr;
-
-    bool openDatabase(std::string& error);
-    bool ensureSchema(std::string& error) const;
     bool loadAccounts(std::string& error);
     bool loadStatements(std::string& error);
-    bool loadLegacyAccounts(std::string& error);
-    bool loadLegacyStatements(std::string& error);
     bool createDefaultData(std::string& error);
-    // 把仍为明文的密码就地替换为 bcrypt 哈希。
-    // 返回 true 表示可以安全落盘；返回 false 表示散列失败（随机数不可用等），
-    // 调用方必须中止写库。upgraded 报告本次是否真的发生了明文→哈希升级。
-    // 注意：必须在 loadStatements() 之后调用再 save()，否则 save() 的
-    // “清空重插”会把尚未加载的流水一并清掉。
+    // 把旧文件中仍为明文的密码升级为 bcrypt；失败时禁止继续写回文件。
     bool hashPlaintextPins(bool& upgraded);
 };
 

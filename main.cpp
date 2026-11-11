@@ -286,7 +286,8 @@ bool configureDataStore() {
         }
     }
 
-    g_store.setBaseDirectory(fixedDirectory.u8string());
+    // main 分支继续使用 accounts.dat/statements.dat 文件保存业务数据。
+    g_store = DataStore(fixedDirectory.u8string());
     return true;
 }
 //初始登录菜单
@@ -461,7 +462,7 @@ void handleLogin() {
         showError(L"该卡已被吞没，请联系银行工作人员。\n本程序不支持退卡操作。");
         return;
     }
-    // 数据库中只保存 bcrypt 哈希：用“用户输入 + 库中保存的盐”重新散列后比对。
+    // 持久化文件中只保存 bcrypt 哈希：用“用户输入 + 文件中保存的盐”重新散列后比对。
     if (!bcrypt::verifyPassword(pin, account->pinHash)) {
         ++g_loginFailures;
         if (g_loginFailures >= 3) {
