@@ -1,12 +1,21 @@
 #include "datastruct.h"
 
+#include "password_hasher.h"
 #include "sqlite3.h"
 
 #include <filesystem>
 #include <fstream>
 #include <sstream>
+#include <string>
 #include <utility>
 #include <vector>
+
+#ifdef _WIN32
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#endif
 
 namespace {
 // 旧版本 .dat 文件使用 | 分隔，迁移时仍保留这个解析器。
@@ -34,6 +43,23 @@ bool parseLongLong(const std::string& value, long long& result) {
 std::string textColumn(sqlite3_stmt* statement, int index) {
     const unsigned char* value = sqlite3_column_text(statement, index);
     return value == nullptr ? std::string() : reinterpret_cast<const char*>(value);
+}
+
+// 把 UTF-8 目录/文件名转换成文件系统路径。
+// Windows 上不能直接用 std::filesystem::path(std::string)（按本地代码页解释）
+// 或 u8path（MinGW 的 libstdc++ 在非 UTF-8 locale 下同样会抛
+// "Illegal byte sequence" 异常），因此统一手动做 UTF-8 → UTF-16 → path。
+std::filesystem::path pathFromUtf8(const std::string& utf8Text) {
+#if defined(_WIN32)
+    if (utf8Text.empty()) return {};
+    const int length = MultiByteToWideChar(CP_UTF8, 0, utf8Text.c_str(), -1, nullptr, 0);
+    if (length <= 0) return std::filesystem::path(utf8Text);
+    std::wstring wide(static_cast<std::size_t>(length) - 1, L'\0');
+    MultiByteToWideChar(CP_UTF8, 0, utf8Text.c_str(), -1, wide.data(), length);
+    return std::filesystem::path(wide);
+#else
+    return std::filesystem::path(utf8Text);
+#endif
 }
 
 void archiveLegacyFile(const std::filesystem::path& filePath) {
@@ -100,9 +126,17 @@ void DataStore::setBaseDirectory(std::string directory) {
 
 bool DataStore::openDatabase(std::string& error) {
     if (database != nullptr) return true;
-    const std::filesystem::path databasePath = std::filesystem::path(baseDirectory) / "atm.db";
-    const int result = sqlite3_open_v2(databasePath.u8string().c_str(), &database,
-                                       SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE, nullptr);
+    const std::filesystem::path databasePath = pathFromUtf8(baseDirectory) / "atm.db";
+    int result = SQLITE_ERROR;
+#if defined(_WIN32)
+    // Windows 从 SQLite 3.28.11 起会把 UTF-8 文件名解释为 UTF-8，但这里统一走
+    // 宽字符接口，避免任何代码页相关的路径问题（含中文目录名）。
+    const std::wstring widePath = databasePath.wstring();
+    result = sqlite3_open16(widePath.c_str(), &database);
+#else
+    result = sqlite3_open_v2(databasePath.u8string().c_str(), &database,
+                             SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE, nullptr);
+#endif
     if (result != SQLITE_OK) {
         error = database == nullptr ? "无法打开 SQLite 数据库。" : sqlite3_errmsg(database);
         if (database != nullptr) sqlite3_close(database);
@@ -137,6 +171,7 @@ bool DataStore::ensureSchema(std::string& error) const {
 bool DataStore::loadAccounts(std::string& error) {
     accounts.clear();
     sqlite3_stmt* statement = nullptr;
+    // 第 3 列 pin 存放的是 bcrypt 哈希，Account::pinHash 直接承接。
     const char* sql = "SELECT id, name, pin, phone, balance_cents, status FROM accounts ORDER BY id;";
     if (sqlite3_prepare_v2(database, sql, -1, &statement, nullptr) != SQLITE_OK) {
         error = sqlite3_errmsg(database);
@@ -199,10 +234,31 @@ bool DataStore::loadStatements(std::string& error) {
     return true;
 }
 
+// 以二进制方式读取整个文本文件。Windows 上使用 _wfopen，保证含中文等
+// 非 ASCII 字符的目录名也能正常打开（std::ifstream 的窄字符路径会按本地
+// 代码页解释而失败）。
+bool readWholeTextFile(const std::filesystem::path& filePath, std::string& content) {
+    content.clear();
+#ifdef _WIN32
+    FILE* file = _wfopen(filePath.c_str(), L"rb");
+#else
+    FILE* file = std::fopen(filePath.string().c_str(), "rb");
+#endif
+    if (file == nullptr) return false;
+    char buffer[4096];
+    std::size_t readBytes = 0;
+    while ((readBytes = std::fread(buffer, 1, sizeof(buffer), file)) > 0) {
+        content.append(buffer, readBytes);
+    }
+    std::fclose(file);
+    return true;
+}
+
 bool DataStore::loadLegacyAccounts(std::string& error) {
-    const std::filesystem::path filePath = std::filesystem::path(baseDirectory) / "accounts.dat";
-    std::ifstream input(filePath, std::ios::binary);
-    if (!input) return true;
+    const std::filesystem::path filePath = pathFromUtf8(baseDirectory) / "accounts.dat";
+    std::string fileContent;
+    if (!readWholeTextFile(filePath, fileContent)) return true;  // 没有旧文件是正常情况
+    std::istringstream input(fileContent);
 
     accounts.clear();
     bool sawLegacyFormat = false;
@@ -242,9 +298,10 @@ bool DataStore::loadLegacyAccounts(std::string& error) {
 }
 
 bool DataStore::loadLegacyStatements(std::string& error) {
-    const std::filesystem::path filePath = std::filesystem::path(baseDirectory) / "statements.dat";
-    std::ifstream input(filePath, std::ios::binary);
-    if (!input) return true;
+    const std::filesystem::path filePath = pathFromUtf8(baseDirectory) / "statements.dat";
+    std::string fileContent;
+    if (!readWholeTextFile(filePath, fileContent)) return true;  // 没有旧文件是正常情况
+    std::istringstream input(fileContent);
 
     statements.clear();
     std::string line;
@@ -273,7 +330,12 @@ bool DataStore::loadLegacyStatements(std::string& error) {
 
 bool DataStore::load(std::string& error) {
     std::error_code filesystemError;
-    std::filesystem::create_directories(baseDirectory, filesystemError);
+    const std::filesystem::path directoryPath = pathFromUtf8(baseDirectory);
+    // 只在目录不存在时创建（MinGW 的 create_directories 在目录已存在时可能
+    // 也返回错误码，这里避开这种实现差异）。
+    if (!std::filesystem::exists(directoryPath, filesystemError)) {
+        std::filesystem::create_directories(directoryPath, filesystemError);
+    }
     if (filesystemError) {
         error = "无法创建数据库目录。";
         return false;
@@ -282,23 +344,61 @@ bool DataStore::load(std::string& error) {
     if (!loadAccounts(error)) return false;
 
     if (accounts.empty()) {
-        const bool hasLegacyAccounts = std::filesystem::exists(
-            std::filesystem::path(baseDirectory) / "accounts.dat");
+        const bool hasLegacyAccounts = std::filesystem::exists(directoryPath / "accounts.dat");
         if (hasLegacyAccounts) {
             if (!loadLegacyAccounts(error) || !loadLegacyStatements(error)) return false;
             if (accounts.empty()) return createDefaultData(error);
             if (!save(error)) return false;
             // 迁移成功后归档旧文件，避免下次启动重复导入。
-            archiveLegacyFile(std::filesystem::path(baseDirectory) / "accounts.dat");
-            archiveLegacyFile(std::filesystem::path(baseDirectory) / "statements.dat");
+            archiveLegacyFile(directoryPath / "accounts.dat");
+            archiveLegacyFile(directoryPath / "statements.dat");
             return true;
         }
         return createDefaultData(error);
     }
-    return loadStatements(error);
+
+    // 旧版本数据库里可能残留明文密码：统一升级成 bcrypt 哈希。
+    // 关键顺序：必须先 loadStatements() 把流水读进内存，再执行迁移回写。
+    // save() 的实现是“清空两张表后按内存缓存重插”，若流水还没加载就回写，
+    // 会把 statements 表清空（历史版本踩过这个坑，务必保持先读后写）。
+    if (!loadStatements(error)) return false;
+    bool upgradedPlaintext = false;
+    if (!hashPlaintextPins(upgradedPlaintext)) {
+        error = "旧数据中的密码无法加密，已中止加载。";
+        return false;
+    }
+    if (upgradedPlaintext && !save(error)) return false;
+    return true;
+}
+
+// 把内存缓存中仍是明文的密码就地替换为 bcrypt 哈希。
+// 返回 true 表示“可以安全写库”（没有明文，或明文已全部散列成功）；
+// 返回 false 表示散列失败（随机数不可用等），调用方必须中止写库。
+// upgraded 通过出参报告本次是否真的发生了明文→哈希的升级。
+bool DataStore::hashPlaintextPins(bool& upgraded) {
+    upgraded = false;
+    for (auto& [id, account] : accounts) {
+        // 空密码不是“明文秘密”，保持原样（登录校验自然失败）。
+        if (account.pinHash.empty()) continue;
+        if (bcrypt::isBcryptHash(account.pinHash)) continue;
+        const std::string hash = bcrypt::hashPassword(account.pinHash);
+        if (hash.empty()) return false;
+        account.pinHash = hash;
+        upgraded = true;
+    }
+    return true;
 }
 
 bool DataStore::save(std::string& error) const {
+    // 最后一道保险：写库前把仍是明文的密码替换成 bcrypt 哈希。
+    // 正常情况下 load()/开户/改密流程已经完成散列，这里只兜底；accounts 是
+    // 本对象的缓存，逻辑上允许整理，故用 const_cast 完成就地规范化。
+    DataStore& self = const_cast<DataStore&>(*this);
+    bool upgraded = false;
+    if (!self.hashPlaintextPins(upgraded)) {
+        error = "密码加密失败，已拒绝写入数据库。";
+        return false;
+    }
     if (database == nullptr) {
         error = "SQLite 数据库尚未打开。";
         return false;
@@ -326,7 +426,7 @@ bool DataStore::save(std::string& error) const {
     for (const auto& [id, account] : accounts) {
         sqlite3_bind_text(accountStatement, 1, account.id.c_str(), -1, SQLITE_TRANSIENT);
         sqlite3_bind_text(accountStatement, 2, account.name.c_str(), -1, SQLITE_TRANSIENT);
-        sqlite3_bind_text(accountStatement, 3, account.pin.c_str(), -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(accountStatement, 3, account.pinHash.c_str(), -1, SQLITE_TRANSIENT);
         sqlite3_bind_text(accountStatement, 4, account.phone.c_str(), -1, SQLITE_TRANSIENT);
         sqlite3_bind_int64(accountStatement, 5, account.balanceCents);
         sqlite3_bind_int(accountStatement, 6, account.status == CardStatus::Normal ? 0 : 1);
