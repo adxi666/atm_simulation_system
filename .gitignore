@@ -13,6 +13,12 @@ data/
 atm_data/
 accounts.dat
 statements.dat
+atm.db
+atm.db-journal
+
+# 测试运行产生的临时数据库
+test_data_encryption/
+test_data_legacy/
 
 # Temporary files
 *.tmp
