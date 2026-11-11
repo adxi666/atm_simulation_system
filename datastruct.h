@@ -7,6 +7,8 @@
 
 struct sqlite3;
 
+// 密码存储采用 bcrypt（加盐 + 慢哈希，具体思路见 password_hasher.h 顶部注释）。
+
 // 卡片状态：正常卡可以登录，吞卡后禁止继续使用。
 enum class CardStatus {
     Normal = 0,
@@ -26,7 +28,10 @@ enum class StatementType {
 struct Account {
     std::string id;
     std::string name;
-    std::string pin;
+    // 密码列（数据库 accounts.pin）。这里保存的是 bcrypt 哈希，例如
+    // "$2b$10$N9qo8uLOickgx2ZMRZoMyeIjZAgcfl7p92ldGxad68LJZdL17lhWy"，
+    // 绝不是明文密码；校验统一使用 bcrypt::verifyPassword()。
+    std::string pinHash;
     std::string phone;
     long long balanceCents = 0;
     CardStatus status = CardStatus::Normal;
@@ -75,6 +80,12 @@ private:
     bool loadLegacyAccounts(std::string& error);
     bool loadLegacyStatements(std::string& error);
     bool createDefaultData(std::string& error);
+    // 把仍为明文的密码就地替换为 bcrypt 哈希。
+    // 返回 true 表示可以安全落盘；返回 false 表示散列失败（随机数不可用等），
+    // 调用方必须中止写库。upgraded 报告本次是否真的发生了明文→哈希升级。
+    // 注意：必须在 loadStatements() 之后调用再 save()，否则 save() 的
+    // “清空重插”会把尚未加载的流水一并清掉。
+    bool hashPlaintextPins(bool& upgraded);
 };
 
 #endif

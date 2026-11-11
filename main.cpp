@@ -1,4 +1,5 @@
 #include "datastruct.h"
+#include "password_hasher.h"
 
 #include <windows.h>
 #include <commctrl.h>
@@ -301,7 +302,8 @@ void showLogin() {
     addButton(L"找回密码", IDC_FORGOT_PASSWORD_BUTTON, 565, 320, 140, 44);
     addButton(L"开户", IDC_OPEN_ACCOUNT_BUTTON, 405, 390, 140, 44);
     addButton(L"退出程序", IDM_EXIT, 565, 390, 140, 44);
-    addLabel(L"演示账户：100001 / 123456；其余样本账户默认密码均为 123456", 180, 480, 650, 32);
+    addLabel(L"演示账户：100001（初始密码可在首次初始化时查看源码或向管理员索取）；其余样本账户初始密码相同",
+             180, 480, 700, 32);
 }
 //开户菜单
 void showOpenAccount() {
@@ -459,7 +461,8 @@ void handleLogin() {
         showError(L"该卡已被吞没，请联系银行工作人员。\n本程序不支持退卡操作。");
         return;
     }
-    if (pin != account->pin) {
+    // 数据库中只保存 bcrypt 哈希：用“用户输入 + 库中保存的盐”重新散列后比对。
+    if (!bcrypt::verifyPassword(pin, account->pinHash)) {
         ++g_loginFailures;
         if (g_loginFailures >= 3) {
             account->status = CardStatus::Retained;
@@ -521,7 +524,13 @@ void handleOpenAccount() {
         return;
     }
 
-    const Account newAccount{id, wideToUtf8(name), wideToUtf8(pin), phone, 0, CardStatus::Normal};
+    // 明文密码只在内存中短暂停留，写入缓存前立即做 bcrypt 散列。
+    const std::string pinHash = bcrypt::hashPassword(wideToUtf8(pin));
+    if (pinHash.empty()) {
+        showError(L"密码加密失败，当前系统随机数不可用，请稍后重试。");
+        return;
+    }
+    const Account newAccount{id, wideToUtf8(name), pinHash, phone, 0, CardStatus::Normal};
     g_store.accounts.emplace(id, newAccount);
     if (!saveStore()) {
         g_store.accounts.erase(id);
@@ -567,11 +576,16 @@ void handleResetPassword() {
         return;
     }
 
-    const std::string oldPin = account->pin;
-    account->pin = wideToUtf8(newPin);
+    const std::string newPinHash = bcrypt::hashPassword(wideToUtf8(newPin));
+    if (newPinHash.empty()) {
+        showError(L"密码加密失败，当前系统随机数不可用，请稍后重试。");
+        return;
+    }
+    const std::string oldPinHash = account->pinHash;
+    account->pinHash = newPinHash;
     g_store.addStatement({g_store.nextStatementId(), account->id, nowString(), StatementType::PasswordChanged, 0, ""});
     if (!saveStore()) {
-        account->pin = oldPin;
+        account->pinHash = oldPinHash;
         g_store.removeLastStatement();
         return;
     }
@@ -673,7 +687,7 @@ void handleChangePin() {
     const std::wstring oldPin = readText(GetDlgItem(g_window, IDC_OLD_PIN));
     const std::wstring newPin = readText(GetDlgItem(g_window, IDC_NEW_PIN));
     const std::wstring confirmPin = readText(GetDlgItem(g_window, IDC_CONFIRM_PIN));
-    if (wideToUtf8(oldPin) != account->pin) {
+    if (!bcrypt::verifyPassword(wideToUtf8(oldPin), account->pinHash)) {
         showError(L"旧密码不正确。");
         return;
     }
@@ -690,11 +704,16 @@ void handleChangePin() {
         return;
     }
 
-    const std::string oldPinValue = account->pin;
-    account->pin = wideToUtf8(newPin);
+    const std::string newPinHash = bcrypt::hashPassword(wideToUtf8(newPin));
+    if (newPinHash.empty()) {
+        showError(L"密码加密失败，当前系统随机数不可用，请稍后重试。");
+        return;
+    }
+    const std::string oldPinHash = account->pinHash;
+    account->pinHash = newPinHash;
     g_store.addStatement({g_store.nextStatementId(), account->id, nowString(), StatementType::PasswordChanged, 0, ""});
     if (!saveStore()) {
-        account->pin = oldPinValue;
+        account->pinHash = oldPinHash;
         g_store.removeLastStatement();
         return;
     }
@@ -706,7 +725,7 @@ void handleDeleteAccount() {
     Account* account = currentAccount();
     if (!account) return;
     const std::string password = wideToUtf8(readText(GetDlgItem(g_window, IDC_DELETE_PASSWORD)));
-    if (password != account->pin) {
+    if (!bcrypt::verifyPassword(password, account->pinHash)) {
         showError(L"当前密码不正确，不能注销账户。");
         return;
     }
